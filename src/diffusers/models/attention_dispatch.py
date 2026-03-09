@@ -35,6 +35,7 @@ from ..utils import (
     is_aiter_available,
     is_aiter_version,
     is_flash_attn_3_available,
+    is_flash_attn_4_available,
     is_flash_attn_available,
     is_flash_attn_version,
     is_kernels_available,
@@ -67,6 +68,7 @@ logger = get_logger(__name__)  # pylint: disable=invalid-name
 
 _CAN_USE_FLASH_ATTN = is_flash_attn_available() and is_flash_attn_version(">=", _REQUIRED_FLASH_VERSION)
 _CAN_USE_FLASH_ATTN_3 = is_flash_attn_3_available()
+_CAN_USE_FLASH_ATTN_4 = is_flash_attn_4_available()
 _CAN_USE_AITER_ATTN = is_aiter_available() and is_aiter_version(">=", _REQUIRED_AITER_VERSION)
 _CAN_USE_SAGE_ATTN = is_sageattention_available() and is_sageattention_version(">=", _REQUIRED_SAGE_VERSION)
 _CAN_USE_FLEX_ATTN = is_torch_version(">=", _REQUIRED_FLEX_VERSION)
@@ -107,6 +109,19 @@ if _CAN_USE_FLASH_ATTN_3:
 else:
     flash_attn_3_func = None
     flash_attn_3_varlen_func = None
+
+if _CAN_USE_FLASH_ATTN_4:
+    try:
+        from flash_attn.cute import flash_attn_func as flash_attn_4_func
+        from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
+    except (ImportError, OSError, RuntimeError) as e:
+        logger.warning(f"flash_attn_4 failed to import: {e}. Falling back to native attention.")
+        _CAN_USE_FLASH_ATTN_4 = False
+        flash_attn_4_func = None
+        flash_attn_4_varlen_func = None
+else:
+    flash_attn_4_func = None
+    flash_attn_4_varlen_func = None
 
 if _CAN_USE_AITER_ATTN:
     try:
@@ -233,6 +248,10 @@ class AttentionBackendName(str, Enum):
     _FLASH_VARLEN_3 = "_flash_varlen_3"
     _FLASH_3_HUB = "_flash_3_hub"
     _FLASH_3_VARLEN_HUB = "_flash_3_varlen_hub"
+    _FLASH_4 = "_flash_4"
+    _FLASH_VARLEN_4 = "_flash_varlen_4"
+    _FLASH_4_HUB = "_flash_4_hub"
+    _FLASH_4_VARLEN_HUB = "_flash_4_varlen_hub"
 
     # `aiter`
     AITER = "aiter"
@@ -787,6 +806,73 @@ def _(
     window_size = (-1, -1)  # noqa: F841
     # A lot of the parameters here are not yet used in any way within diffusers.
     # We can safely ignore for now and keep the fake op shape propagation simple.
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    lse_shape = (batch_size, seq_len, num_heads)
+    return torch.empty_like(q), q.new_empty(lse_shape)
+
+
+@_custom_op("_diffusers_flash_attn_4::_flash_attn_forward", mutates_args=(), device_types="cuda")
+def _wrapped_flash_attn_4(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    qv: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: bool | None = None,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    window_size = (-1, -1)
+    result = flash_attn_4_func(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        qv=qv,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+        return_attn_probs=True,
+    )
+    out, lse, *_ = result
+    lse = lse.permute(0, 2, 1)
+    return out, lse
+
+
+@_register_fake("_diffusers_flash_attn_4::_flash_attn_forward")
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    qv: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    attention_chunk: int = 0,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: bool | None = None,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    window_size = (-1, -1)  # noqa: F841
     batch_size, seq_len, num_heads, head_dim = q.shape
     lse_shape = (batch_size, seq_len, num_heads)
     return torch.empty_like(q), q.new_empty(lse_shape)
@@ -1376,6 +1462,136 @@ def _flash_attention_3_hub_backward_op(
     if wrapped_backward_fn is None:
         raise RuntimeError(
             "Flash attention 3 hub kernels must expose `flash_attn_interface._flash_attn_backward` "
+            "for context parallel execution."
+        )
+
+    query, key, value, out, softmax_lse = ctx.saved_tensors
+    grad_query = torch.empty_like(query)
+    grad_key = torch.empty_like(key)
+    grad_value = torch.empty_like(value)
+
+    wrapped_backward_fn(
+        grad_out,
+        query,
+        key,
+        value,
+        out,
+        softmax_lse,
+        None,
+        None,  # cu_seqlens_q, cu_seqlens_k
+        None,
+        None,  # seqused_q, seqused_k
+        None,
+        None,  # max_seqlen_q, max_seqlen_k
+        grad_query,
+        grad_key,
+        grad_value,
+        ctx.scale,
+        ctx.is_causal,
+        ctx.window_size[0],
+        ctx.window_size[1],
+        ctx.softcap,
+        ctx.deterministic,
+        ctx.sm_margin,
+    )
+
+    grad_query = grad_query[..., : grad_out.shape[-1]]
+    grad_key = grad_key[..., : grad_out.shape[-1]]
+    grad_value = grad_value[..., : grad_out.shape[-1]]
+
+    return grad_query, grad_key, grad_value
+
+
+def _flash_attention_4_hub_forward_op(
+    ctx: torch.autograd.function.FunctionCtx,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+    return_lse: bool = False,
+    _save_ctx: bool = True,
+    _parallel_config: "ParallelConfig" | None = None,
+    *,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: bool | None = None,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+):
+    if attn_mask is not None:
+        raise ValueError("`attn_mask` is not yet supported for flash-attn 4 hub kernels.")
+    if dropout_p != 0.0:
+        raise ValueError("`dropout_p` is not yet supported for flash-attn 4 hub kernels.")
+    if enable_gqa:
+        raise ValueError("`enable_gqa` is not yet supported for flash-attn 4 hub kernels.")
+
+    config = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_4_HUB]
+    wrapped_forward_fn = config.wrapped_forward_fn
+    if wrapped_forward_fn is None:
+        raise RuntimeError(
+            "Flash attention 4 hub kernels must expose `flash_attn_interface._flash_attn_forward` "
+            "for context parallel execution."
+        )
+
+    if scale is None:
+        scale = query.shape[-1] ** (-0.5)
+
+    out, softmax_lse, *_ = wrapped_forward_fn(
+        query,
+        key,
+        value,
+        None,
+        None,  # k_new, v_new
+        None,  # qv
+        None,  # out
+        None,
+        None,
+        None,  # cu_seqlens_q/k/k_new
+        None,
+        None,
+        None,  # seqused_q, seqused_k
+        None,
+        None,  # max_seqlen_q, max_seqlen_k
+        None,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=window_size,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        sm_margin=sm_margin,
+        return_softmax_lse=return_lse,
+    )
+
+    if _save_ctx:
+        ctx.save_for_backward(query, key, value, out, softmax_lse)
+        ctx.scale = scale
+        ctx.is_causal = is_causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.deterministic = deterministic
+        ctx.sm_margin = sm_margin
+
+    return (out, softmax_lse) if return_lse else out
+
+
+def _flash_attention_4_hub_backward_op(
+    ctx: torch.autograd.function.FunctionCtx,
+    grad_out: torch.Tensor,
+    *args,
+    **kwargs,
+):
+    config = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_4_HUB]
+    wrapped_backward_fn = config.wrapped_backward_fn
+    if wrapped_backward_fn is None:
+        raise RuntimeError(
+            "Flash attention 4 hub kernels must expose `flash_attn_interface._flash_attn_backward` "
             "for context parallel execution."
         )
 
@@ -2541,6 +2757,33 @@ def _flash_attention_3(
 
 
 @_AttentionBackendRegistry.register(
+    AttentionBackendName._FLASH_4,
+    constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
+)
+def _flash_attention_4(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    _parallel_config: "ParallelConfig" | None = None,
+) -> torch.Tensor:
+    if attn_mask is not None:
+        raise ValueError("`attn_mask` is not supported for flash-attn 4.")
+
+    out, lse = _wrapped_flash_attn_4(
+        q=query,
+        k=key,
+        v=value,
+        softmax_scale=scale,
+        causal=is_causal,
+    )
+    return (out, lse) if return_lse else out
+
+
+@_AttentionBackendRegistry.register(
     AttentionBackendName._FLASH_3_HUB,
     constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
     supports_context_parallel=True,
@@ -2594,6 +2837,93 @@ def _flash_attention_3_hub(
     )
     backward_op = functools.partial(
         _flash_attention_3_hub_backward_op,
+        window_size=window_size,
+        softcap=softcap,
+        num_splits=1,
+        pack_gqa=None,
+        deterministic=deterministic,
+        sm_margin=0,
+    )
+    out = _templated_context_parallel_attention(
+        query,
+        key,
+        value,
+        None,
+        0.0,
+        is_causal,
+        scale,
+        False,
+        return_attn_probs,
+        forward_op=forward_op,
+        backward_op=backward_op,
+        _parallel_config=_parallel_config,
+    )
+    if return_attn_probs:
+        out, lse = out
+        return out, lse
+
+    return out
+
+
+@_AttentionBackendRegistry.register(
+    AttentionBackendName._FLASH_4_HUB,
+    constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
+    supports_context_parallel=True,
+)
+def _flash_attention_4_hub(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    is_causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    dropout_p: float = 0.0,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    _parallel_config: "ParallelConfig" | None = None,
+) -> torch.Tensor:
+    if attn_mask is not None:
+        raise ValueError("`attn_mask` is not supported for flash-attn 4 hub kernels.")
+    if dropout_p is not None and dropout_p > 0:
+        raise ValueError("`dropout_p` is not yet supported for flash-attn 4 hub kernels.")
+    if _parallel_config is not None:
+        raise ValueError("`enable_gqa` is not yet supported for flash-attn 4 hub kernels.")
+
+    func = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_4_HUB].kernel_fn
+    if _parallel_config is None:
+        out = func(
+            q=query,
+            k=key,
+            v=value,
+            softmax_scale=scale,
+            causal=is_causal,
+            qv=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=1,
+            pack_gqa=None,
+            deterministic=deterministic,
+            sm_margin=0,
+            return_attn_probs=return_attn_probs,
+        )
+        return (out[0], out[1]) if return_attn_probs else out
+
+    forward_op = functools.partial(
+        _flash_attention_4_hub_forward_op,
+        window_size=window_size,
+        softcap=softcap,
+        num_splits=1,
+        pack_gqa=None,
+        deterministic=deterministic,
+        sm_margin=0,
+    )
+    backward_op = functools.partial(
+        _flash_attention_4_hub_backward_op,
         window_size=window_size,
         softcap=softcap,
         num_splits=1,
@@ -2677,6 +3007,60 @@ def _flash_attention_3_varlen_hub(
 
 
 @_AttentionBackendRegistry.register(
+    AttentionBackendName._FLASH_4_VARLEN_HUB,
+    constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
+    supports_context_parallel=False,
+)
+def _flash_attention_4_varlen_hub(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    _parallel_config: "ParallelConfig" | None = None,
+) -> torch.Tensor:
+    batch_size, seq_len_q, _, _ = query.shape
+    _, seq_len_kv, _, _ = key.shape
+
+    if attn_mask is not None:
+        attn_mask = _normalize_attn_mask(attn_mask, batch_size, seq_len_kv)
+
+    (_, seqlens_k), (cu_seqlens_q, cu_seqlens_k), (max_seqlen_q, max_seqlen_k) = (
+        _prepare_for_flash_attn_or_sage_varlen(
+            batch_size, seq_len_q, seq_len_kv, attn_mask=attn_mask, device=query.device
+        )
+    )
+
+    key_valid, value_valid = [], []
+    for b in range(batch_size):
+        valid_len = seqlens_k[b]
+        key_valid.append(key[b, :valid_len])
+        value_valid.append(value[b, :valid_len])
+
+    query_packed = query.flatten(0, 1)
+    key_packed = torch.cat(key_valid, dim=0)
+    value_packed = torch.cat(value_valid, dim=0)
+
+    func = _HUB_KERNELS_REGISTRY[AttentionBackendName._FLASH_4_VARLEN_HUB].kernel_fn
+    out, lse, *_ = func(
+        q=query_packed,
+        k=key_packed,
+        v=value_packed,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=scale,
+        causal=is_causal,
+    )
+    out = out.unflatten(0, (batch_size, -1))
+
+    return (out, lse) if return_lse else out
+
+
+@_AttentionBackendRegistry.register(
     AttentionBackendName._FLASH_VARLEN_3,
     constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
 )
@@ -2713,6 +3097,64 @@ def _flash_varlen_attention_3(
     value_packed = torch.cat(value_valid, dim=0)
 
     result = flash_attn_3_varlen_func(
+        q=query_packed,
+        k=key_packed,
+        v=value_packed,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=scale,
+        causal=is_causal,
+        return_attn_probs=return_lse,
+    )
+    if isinstance(result, tuple):
+        out, lse, *_ = result
+    else:
+        out = result
+        lse = None
+    out = out.unflatten(0, (batch_size, -1))
+
+    return (out, lse) if return_lse else out
+
+
+@_AttentionBackendRegistry.register(
+    AttentionBackendName._FLASH_VARLEN_4,
+    constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
+)
+def _flash_varlen_attention_4(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    scale: float | None = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    _parallel_config: "ParallelConfig" | None = None,
+) -> torch.Tensor:
+    batch_size, seq_len_q, _, _ = query.shape
+    _, seq_len_kv, _, _ = key.shape
+
+    if attn_mask is not None:
+        attn_mask = _normalize_attn_mask(attn_mask, batch_size, seq_len_kv)
+
+    (_, seqlens_k), (cu_seqlens_q, cu_seqlens_k), (max_seqlen_q, max_seqlen_k) = (
+        _prepare_for_flash_attn_or_sage_varlen(
+            batch_size, seq_len_q, seq_len_kv, attn_mask=attn_mask, device=query.device
+        )
+    )
+
+    key_valid, value_valid = [], []
+    for b in range(batch_size):
+        valid_len = seqlens_k[b]
+        key_valid.append(key[b, :valid_len])
+        value_valid.append(value[b, :valid_len])
+
+    query_packed = query.flatten(0, 1)
+    key_packed = torch.cat(key_valid, dim=0)
+    value_packed = torch.cat(value_valid, dim=0)
+
+    result = flash_attn_4_varlen_func(
         q=query_packed,
         k=key_packed,
         v=value_packed,

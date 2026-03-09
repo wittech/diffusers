@@ -227,6 +227,7 @@ _cosmos_guardrail_available, _cosmos_guardrail_version = _is_package_available("
 _sageattention_available, _sageattention_version = _is_package_available("sageattention")
 _flash_attn_available, _flash_attn_version = _is_package_available("flash_attn")
 _flash_attn_3_available, _flash_attn_3_version = _is_package_available("flash_attn_3")
+_flash_attn_4_available, _flash_attn_4_version = _is_package_available("flash-attn-4")
 _aiter_available, _aiter_version = _is_package_available("aiter", get_dist_name=True)
 _kornia_available, _kornia_version = _is_package_available("kornia")
 _nvidia_modelopt_available, _nvidia_modelopt_version = _is_package_available("modelopt", get_dist_name=True)
@@ -407,6 +408,10 @@ def is_flash_attn_available():
 
 def is_flash_attn_3_available():
     return _flash_attn_3_available
+
+
+def is_flash_attn_4_available():
+    return _flash_attn_4_available
 
 
 def is_aiter_available():
